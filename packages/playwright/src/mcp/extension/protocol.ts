@@ -20,6 +20,11 @@ export const VERSION = 1;
 
 export type ExtensionCommand = {
   'attachToTab': {
+    params: {
+      tabId?: number; // Optional tab ID. If not provided, attach to current tab.
+    };
+  };
+  'listTabs': {
     params: {};
   };
   'forwardCDPCommand': {
@@ -37,6 +42,17 @@ export type ExtensionEvents = {
       method: string,
       sessionId?: string
       params?: any,
+    };
+  };
+  'tabCreated': {
+    params: {
+      tabId: number;
+      targetInfo: any;
+    };
+  };
+  'tabRemoved': {
+    params: {
+      tabId: number;
     };
   };
 };

@@ -67,9 +67,14 @@ export class CDPRelayServer {
   private _wss: WebSocketServer;
   private _playwrightConnection: WebSocket | null = null;
   private _extensionConnection: ExtensionConnection | null = null;
+  // Map of targetId -> { targetInfo, sessionId } for tracking all attached targets (including child tabs)
+  private _connectedTargets: Map<string, {
+    targetInfo: any;
+    sessionId: string;
+  }> = new Map();
+  // Keep backward compatibility: track the first attached tab as "current"
   private _connectedTabInfo: {
     targetInfo: any;
-    // Page sessionId that should be used by this connection.
     sessionId: string;
   } | undefined;
   private _nextSessionId: number = 1;
@@ -214,6 +219,7 @@ export class CDPRelayServer {
 
   private _resetExtensionConnection() {
     this._connectedTabInfo = undefined;
+    this._connectedTargets.clear();
     this._extensionConnection = null;
     this._extensionConnectionPromise = new ManualPromise();
     void this._extensionConnectionPromise.catch(logUnhandledError);
@@ -244,14 +250,129 @@ export class CDPRelayServer {
 
   private _handleExtensionMessage<M extends keyof ExtensionEvents>(method: M, params: ExtensionEvents[M]['params']) {
     switch (method) {
-      case 'forwardCDPEvent':
-        const sessionId = params.sessionId || this._connectedTabInfo?.sessionId;
+      case 'forwardCDPEvent': {
+        const eventParams = params as ExtensionEvents['forwardCDPEvent']['params'];
+        
+        // Log all events for debugging
+        debugLogger('← Extension event:', eventParams.method, eventParams.params);
+        
+        // Handle Page.windowOpen events - this indicates a new window/tab was opened
+        // When we receive this, we should also receive Target.targetCreated or Target.attachedToTarget
+        if (eventParams.method === 'Page.windowOpen') {
+          debugLogger('Received Page.windowOpen event:', eventParams.params);
+          // Note: Target.attachedToTarget should follow this event if Target.setAutoAttach is working
+          // If not, we might need to manually attach using Target.targetCreated + Target.attachToTarget
+        }
+        
+        // Handle Target.targetCreated events - these indicate new targets were discovered
+        // This is a fallback when Target.setAutoAttach doesn't work in extension mode
+        if (eventParams.method === 'Target.targetCreated') {
+          debugLogger('Received Target.targetCreated event:', eventParams.params);
+          const targetInfo = eventParams.params?.targetInfo;
+          if (targetInfo && targetInfo.openerId) {
+            // This is a new target with an opener (likely a new tab opened from current tab)
+            // Check if we should auto-attach to it
+            const openerTarget = Array.from(this._connectedTargets.values()).find(
+              t => t.targetInfo.targetId === targetInfo.openerId
+            );
+            if (openerTarget && targetInfo.type === 'page') {
+              debugLogger(`New target created with opener: ${targetInfo.targetId}, attempting to attach`);
+              // Try to attach to the new target
+              void this._attachToNewTarget(targetInfo);
+            }
+          }
+        }
+        
+        // Handle Target.attachedToTarget events - these indicate new child tabs/pages were opened.
+        // This works for both:
+        // - Links with target="_blank"
+        // - JavaScript window.open() calls
+        // - Any other mechanism that creates a new target with openerId
+        if (eventParams.method === 'Target.attachedToTarget') {
+          debugLogger('Received Target.attachedToTarget event:', eventParams.params);
+          const targetInfo = eventParams.params?.targetInfo;
+          const childSessionId = eventParams.params?.sessionId;
+          if (targetInfo && childSessionId) {
+            // In extension mode, browserContextId might be missing from targetInfo
+            // Use the main tab's browserContextId as fallback
+            if (!targetInfo.browserContextId && this._connectedTabInfo?.targetInfo?.browserContextId) {
+              targetInfo.browserContextId = this._connectedTabInfo.targetInfo.browserContextId;
+              debugLogger('Added browserContextId from main tab:', targetInfo.browserContextId);
+            }
+            
+            // Track the new target (could be a new tab opened from current tab via link or JS)
+            this._connectedTargets.set(targetInfo.targetId, {
+              targetInfo,
+              sessionId: childSessionId,
+            });
+            const openerInfo = targetInfo.openerId ? ` (opener: ${targetInfo.openerId})` : '';
+            const browserContextInfo = targetInfo.browserContextId ? ` (browserContextId: ${targetInfo.browserContextId})` : ' (NO browserContextId!)';
+            debugLogger(`New child target attached: ${targetInfo.targetId} (type: ${targetInfo.type}, url: ${targetInfo.url})${openerInfo}${browserContextInfo}`);
+          } else {
+            debugLogger('Target.attachedToTarget event missing targetInfo or sessionId:', { targetInfo, childSessionId });
+          }
+        } else if (eventParams.method === 'Target.detachedFromTarget') {
+          const targetId = eventParams.params?.targetId;
+          if (targetId) {
+            this._connectedTargets.delete(targetId);
+            debugLogger(`Target detached: ${targetId}`);
+          }
+        }
+        
+        // Forward the event to Playwright
+        // For Target.attachedToTarget and Target.detachedFromTarget, these events are sent FROM the parent session
+        // to notify about child session changes. The child sessionId is in params.sessionId, NOT top-level.
+        // For other events, use the top-level sessionId or fallback to main tab sessionId
+        let sessionId: string | undefined;
+        let paramsToSend = eventParams.params;
+
+        if (eventParams.method === 'Target.attachedToTarget') {
+          // IMPORTANT: This event is sent FROM the parent session (main tab), not from the child session
+          // The params.sessionId contains the NEW child session ID, which should stay in params
+          // The top-level sessionId should be undefined (main tab in extension mode has no sessionId)
+          sessionId = undefined;
+          // Ensure browserContextId is present in targetInfo before forwarding to Playwright
+          // Playwright requires this field to process the event correctly
+          if (paramsToSend?.targetInfo && !paramsToSend.targetInfo.browserContextId) {
+            // Try to get it from main tab
+            if (this._connectedTabInfo?.targetInfo?.browserContextId) {
+              paramsToSend = {
+                ...paramsToSend,
+                targetInfo: {
+                  ...paramsToSend.targetInfo,
+                  browserContextId: this._connectedTabInfo.targetInfo.browserContextId,
+                },
+              };
+              debugLogger('Added browserContextId to Target.attachedToTarget before forwarding to Playwright');
+            } else {
+              // If main tab also doesn't have it, use a default value
+              // In extension mode, we can use the main tab's targetId as a fallback
+              // or use a default browserContextId
+              paramsToSend = {
+                ...paramsToSend,
+                targetInfo: {
+                  ...paramsToSend.targetInfo,
+                  browserContextId: this._connectedTabInfo?.targetInfo?.targetId || 'default',
+                },
+              };
+              debugLogger('Using fallback browserContextId for Target.attachedToTarget');
+            }
+          }
+        } else if (eventParams.method === 'Target.detachedFromTarget') {
+          // IMPORTANT: This event is also sent FROM the parent session, not from the child session
+          sessionId = undefined;
+        } else {
+          sessionId = eventParams.sessionId || this._connectedTabInfo?.sessionId;
+        }
+        debugLogger(`→ Playwright: ${eventParams.method} (sessionId: ${sessionId})`);
         this._sendToPlaywright({
           sessionId,
-          method: params.method,
-          params: params.params
+          method: eventParams.method,
+          params: paramsToSend
         });
         break;
+      }
+      // tabCreated/tabRemoved events are not needed for scheme B - CDP handles it automatically
     }
   }
 
@@ -284,43 +405,137 @@ export class CDPRelayServer {
         return { };
       }
       case 'Target.setAutoAttach': {
-        // Forward child session handling.
+        // Forward child session handling to child sessions.
         if (sessionId)
           break;
-        // Simulate auto-attach behavior with real target info
+        
+        // Attach to the current tab first
         const { targetInfo } = await this._extensionConnection!.send('attachToTab', { });
+        const mainSessionId = `pw-tab-${this._nextSessionId++}`;
+        
+        // In extension mode, browserContextId might be missing
+        // We'll use the targetId as a fallback browserContextId if needed
+        if (!targetInfo.browserContextId) {
+          targetInfo.browserContextId = targetInfo.targetId || 'default';
+          debugLogger('Main tab targetInfo missing browserContextId, using fallback:', targetInfo.browserContextId);
+        }
+        
         this._connectedTabInfo = {
           targetInfo,
-          sessionId: `pw-tab-${this._nextSessionId++}`,
+          sessionId: mainSessionId,
         };
-        debugLogger('Simulating auto-attach');
+        this._connectedTargets.set(targetInfo.targetId, {
+          targetInfo,
+          sessionId: mainSessionId,
+        });
+        
+        debugLogger('Main tab attached:', { targetId: targetInfo.targetId, browserContextId: targetInfo.browserContextId });
+        
+        // Forward setAutoAttach to extension - this enables Chrome to automatically
+        // attach to child targets. This includes:
+        // - New tabs opened via links (target="_blank")
+        // - New tabs/pages opened via JavaScript (window.open())
+        // - Any other targets with openerId pointing to the current tab
+        // The params from Playwright (autoAttach, waitForDebuggerOnStart, flatten, etc.)
+        // are forwarded as-is to ensure proper behavior.
+        debugLogger(`Forwarding Target.setAutoAttach with params:`, params);
+        const setAutoAttachResult = await this._forwardToExtension(method, params, undefined);
+        debugLogger('Target.setAutoAttach result:', setAutoAttachResult);
+        
+        // Also enable target discovery to catch new tabs that might not be auto-attached
+        // This is a fallback mechanism for extension mode
+        try {
+          await this._forwardToExtension('Target.setDiscoverTargets', { discover: true }, undefined);
+          debugLogger('Enabled Target.setDiscoverTargets');
+        } catch (e) {
+          debugLogger('Target.setDiscoverTargets not supported or failed:', e);
+        }
+        
+        debugLogger('Attached to current tab and enabled auto-attach for child targets (including window.open())');
+        
+        // Notify Playwright about the main target
         this._sendToPlaywright({
           method: 'Target.attachedToTarget',
           params: {
-            sessionId: this._connectedTabInfo.sessionId,
+            sessionId: mainSessionId,
             targetInfo: {
-              ...this._connectedTabInfo.targetInfo,
+              ...targetInfo,
               attached: true,
             },
             waitingForDebugger: false
           }
         });
+        
         return { };
       }
       case 'Target.getTargetInfo': {
+        // Return info for the first attached tab for backward compatibility
         return this._connectedTabInfo?.targetInfo;
+      }
+      case 'Target.getTargets': {
+        // Return all known attached targets (main tab + child tabs)
+        const targetInfos = [];
+        for (const [targetId, target] of this._connectedTargets.entries()) {
+          targetInfos.push({
+            targetId,
+            type: target.targetInfo.type || 'page',
+            title: target.targetInfo.title || '',
+            url: target.targetInfo.url || '',
+            attached: true,
+            browserContextId: target.targetInfo.browserContextId,
+            openerId: target.targetInfo.openerId,
+          });
+        }
+        return { targetInfos };
       }
     }
     return await this._forwardToExtension(method, params, sessionId);
+  }
+  
+
+  private async _attachToNewTarget(targetInfo: any) {
+    // Try to attach to the new target using Target.attachToTarget
+    // This might not work in extension mode, but we try anyway
+    try {
+      debugLogger(`Attempting to attach to new target: ${targetInfo.targetId}`);
+      const result = await this._forwardToExtension('Target.attachToTarget', { targetId: targetInfo.targetId }, undefined);
+      if (result && result.sessionId) {
+        const newSessionId = result.sessionId;
+        this._connectedTargets.set(targetInfo.targetId, {
+          targetInfo,
+          sessionId: newSessionId,
+        });
+        debugLogger(`Successfully attached to new target: ${targetInfo.targetId} with sessionId: ${newSessionId}`);
+        
+        // Notify Playwright about the new target
+        this._sendToPlaywright({
+          method: 'Target.attachedToTarget',
+          params: {
+            sessionId: newSessionId,
+            targetInfo: {
+              ...targetInfo,
+              attached: true,
+            },
+            waitingForDebugger: false
+          }
+        });
+      }
+    } catch (e) {
+      debugLogger(`Failed to attach to new target ${targetInfo.targetId}:`, e);
+      // This is expected in extension mode - we might need extension support for this
+    }
   }
 
   private async _forwardToExtension(method: string, params: any, sessionId: string | undefined): Promise<any> {
     if (!this._extensionConnection)
       throw new Error('Extension not connected');
     // Top level sessionId is only passed between the relay and the client.
-    if (this._connectedTabInfo?.sessionId === sessionId)
-      sessionId = undefined;
-    return await this._extensionConnection.send('forwardCDPCommand', { sessionId, method, params });
+    // If it matches the current tab's sessionId, clear it for backward compatibility
+    // (extension expects undefined for the main tab session)
+    let actualSessionId = sessionId;
+    if (sessionId && this._connectedTabInfo?.sessionId === sessionId)
+      actualSessionId = undefined;
+    return await this._extensionConnection.send('forwardCDPCommand', { sessionId: actualSessionId, method, params });
   }
 
   private _sendToPlaywright(message: CDPResponse): void {

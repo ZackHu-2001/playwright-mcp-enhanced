@@ -288,26 +288,40 @@ export class CDPRelayServer {
         // - Links with target="_blank"
         // - JavaScript window.open() calls
         // - Any other mechanism that creates a new target with openerId
+        // Track whether we should forward this event to Playwright
+        let shouldForward = true;
+
         if (eventParams.method === 'Target.attachedToTarget') {
           debugLogger('Received Target.attachedToTarget event:', eventParams.params);
           const targetInfo = eventParams.params?.targetInfo;
           const childSessionId = eventParams.params?.sessionId;
           if (targetInfo && childSessionId) {
-            // In extension mode, browserContextId might be missing from targetInfo
-            // Use the main tab's browserContextId as fallback
-            if (!targetInfo.browserContextId && this._connectedTabInfo?.targetInfo?.browserContextId) {
-              targetInfo.browserContextId = this._connectedTabInfo.targetInfo.browserContextId;
-              debugLogger('Added browserContextId from main tab:', targetInfo.browserContextId);
+            // IMPORTANT: In Chrome Extension mode, sessionIds for iframes/workers/service_workers
+            // are not supported by chrome.debugger.sendCommand(). Only 'page' type targets
+            // (new tabs) should be forwarded to Playwright.
+            const targetType = targetInfo.type;
+            if (targetType !== 'page') {
+              // Skip iframes, service_workers, workers, etc.
+              // Don't track them and don't forward to Playwright
+              debugLogger(`Skipping non-page target: ${targetInfo.targetId} (type: ${targetType}) - not supported in extension mode`);
+              shouldForward = false;
+            } else {
+              // In extension mode, browserContextId might be missing from targetInfo
+              // Use the main tab's browserContextId as fallback
+              if (!targetInfo.browserContextId && this._connectedTabInfo?.targetInfo?.browserContextId) {
+                targetInfo.browserContextId = this._connectedTabInfo.targetInfo.browserContextId;
+                debugLogger('Added browserContextId from main tab:', targetInfo.browserContextId);
+              }
+
+              // Track the new target (could be a new tab opened from current tab via link or JS)
+              this._connectedTargets.set(targetInfo.targetId, {
+                targetInfo,
+                sessionId: childSessionId,
+              });
+              const openerInfo = targetInfo.openerId ? ` (opener: ${targetInfo.openerId})` : '';
+              const browserContextInfo = targetInfo.browserContextId ? ` (browserContextId: ${targetInfo.browserContextId})` : ' (NO browserContextId!)';
+              debugLogger(`New child target attached: ${targetInfo.targetId} (type: ${targetInfo.type}, url: ${targetInfo.url})${openerInfo}${browserContextInfo}`);
             }
-            
-            // Track the new target (could be a new tab opened from current tab via link or JS)
-            this._connectedTargets.set(targetInfo.targetId, {
-              targetInfo,
-              sessionId: childSessionId,
-            });
-            const openerInfo = targetInfo.openerId ? ` (opener: ${targetInfo.openerId})` : '';
-            const browserContextInfo = targetInfo.browserContextId ? ` (browserContextId: ${targetInfo.browserContextId})` : ' (NO browserContextId!)';
-            debugLogger(`New child target attached: ${targetInfo.targetId} (type: ${targetInfo.type}, url: ${targetInfo.url})${openerInfo}${browserContextInfo}`);
           } else {
             debugLogger('Target.attachedToTarget event missing targetInfo or sessionId:', { targetInfo, childSessionId });
           }
@@ -318,7 +332,12 @@ export class CDPRelayServer {
             debugLogger(`Target detached: ${targetId}`);
           }
         }
-        
+
+        // Only forward the event to Playwright if we should
+        if (!shouldForward) {
+          break;
+        }
+
         // Forward the event to Playwright
         // For Target.attachedToTarget and Target.detachedFromTarget, these events are sent FROM the parent session
         // to notify about child session changes. The child sessionId is in params.sessionId, NOT top-level.
